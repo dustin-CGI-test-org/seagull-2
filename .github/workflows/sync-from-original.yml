@@ -7,23 +7,15 @@
 #
 # This file must be on the new repo's DEFAULT branch, or the
 # repository_dispatch event will not trigger it.
-#
-# Setup:
-#   1. Make these available to this repo (repo-level, or org-level limited
-#      to the two repos):
-#        variable  SUBDIR_SYNC_APP_CLIENT_ID    the App's Client ID
-#        secret    SUBDIR_SYNC_APP_PRIVATE_KEY  full contents of the App's .pem key
-#   2. The App needs "Contents: Read and write" and must be installed on
-#      both repos.
 
 name: Sync from original repo
 
 on:
   repository_dispatch:
     types: [subdir-updated]
-  workflow_dispatch:
+  workflow_dispatch:                       # lets you run a sync by hand
 
-permissions: {}
+permissions: {}                            # the built-in GITHUB_TOKEN is not used
 
 concurrency:
   group: subdir-sync                       # never run two syncs at once
@@ -71,10 +63,12 @@ jobs:
         working-directory: source
         run: git subtree split --prefix="$SUBDIR" -b subdir-split
 
+      # Checks out the default branch, which always exists. fetch-depth: 0
+      # also fetches every other branch, so the next step can tell whether
+      # TARGET_BRANCH exists yet.
       - name: Check out this repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ env.TARGET_BRANCH }}
           token: ${{ steps.app-token.outputs.token }}   # push as the App
           fetch-depth: 0
           path: target
@@ -89,6 +83,16 @@ jobs:
           git config user.email "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
           git fetch ../source subdir-split
+
+          # If the target branch doesn't exist, create it from the split
+          # and stop; there is nothing to merge into.
+          if ! git show-ref --verify --quiet "refs/remotes/origin/${TARGET_BRANCH}"; then
+            echo "Branch '${TARGET_BRANCH}' not found; creating it from the split."
+            git push origin "FETCH_HEAD:refs/heads/${TARGET_BRANCH}"
+            exit 0
+          fi
+
+          git checkout -B "$TARGET_BRANCH" "origin/${TARGET_BRANCH}"
 
           if git merge-base --is-ancestor FETCH_HEAD HEAD; then
             echo "Already up to date; nothing to sync."
