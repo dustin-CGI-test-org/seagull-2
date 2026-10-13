@@ -32,7 +32,7 @@ concurrency:
 env:
   SOURCE_REPO: dustin-CGI-test-org/seagull
   SOURCE_BRANCH: develop
-  SUBDIR: seagull/subdir
+  SUBDIR: subdir
   TARGET_BRANCH: sync-branch
 
 jobs:
