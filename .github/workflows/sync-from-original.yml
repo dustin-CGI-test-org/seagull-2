@@ -7,6 +7,7 @@
 #
 # This file must be on the new repo's DEFAULT branch, or the
 # repository_dispatch event will not trigger it.
+#
 
 name: Sync from original repo
 
@@ -26,6 +27,7 @@ env:
   SOURCE_BRANCH: develop
   SUBDIR: subdir
   TARGET_BRANCH: sync-branch
+  PR_BASE: develop
 
 jobs:
   sync:
@@ -41,6 +43,7 @@ jobs:
             ${{ env.SOURCE_REPO }}
             ${{ github.repository }}
           permission-contents: write       # read the original, push to this repo
+          permission-pull-requests: write  # open the PR into PR_BASE
 
       - name: Look up the App's bot user ID (for commit attribution)
         id: bot
@@ -103,3 +106,31 @@ jobs:
           # A conflict fails the job so you can resolve it by hand.
           git merge --no-edit FETCH_HEAD
           git push origin "HEAD:${TARGET_BRANCH}"
+
+      # Runs even when the step above found nothing new, so a missing PR is
+      # always opened if TARGET_BRANCH has commits PR_BASE doesn't.
+      - name: Open a pull request into the base branch
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          git fetch origin "$PR_BASE" "$TARGET_BRANCH"
+
+          ahead=$(git rev-list --count "origin/${PR_BASE}..origin/${TARGET_BRANCH}")
+          if [ "$ahead" -eq 0 ]; then
+            echo "'${PR_BASE}' already has everything in '${TARGET_BRANCH}'; no PR needed."
+            exit 0
+          fi
+
+          open=$(gh pr list --repo "$REPO" --head "$TARGET_BRANCH" --base "$PR_BASE" \
+                   --state open --json number --jq 'length')
+          if [ "$open" -gt 0 ]; then
+            echo "A pull request is already open; it now includes the new commits."
+            exit 0
+          fi
+
+          gh pr create --repo "$REPO" \
+            --head "$TARGET_BRANCH" --base "$PR_BASE" \
+            --title "Sync ${SUBDIR} from ${SOURCE_REPO}" \
+            --body "Automated sync of \`${SUBDIR}\` from ${SOURCE_REPO} (\`${SOURCE_BRANCH}\`)."
