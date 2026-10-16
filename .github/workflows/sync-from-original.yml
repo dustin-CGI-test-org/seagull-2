@@ -19,8 +19,12 @@
 #      to the two repos):
 #        variable  SUBDIR_SYNC_APP_CLIENT_ID    the App's Client ID
 #        secret    SUBDIR_SYNC_APP_PRIVATE_KEY  full contents of the App's .pem key
-#   3. The App needs "Contents: Read and write" and must be installed on
-#      both repos.
+#   3. The App needs "Contents: Read and write" and "Pull requests: Read and
+#      write", and must be installed on both repos.
+#
+# After pushing, it opens a PR from TARGET_BRANCH into PR_BASE_BRANCH if one
+# isn't already open. Merge it with a merge commit (not squash or rebase), and
+# don't delete TARGET_BRANCH afterwards.
 
 name: Sync from original repo
 
@@ -41,6 +45,7 @@ env:
   SOURCE_DIR: subdir
   TARGET_DIR: subdir
   TARGET_BRANCH: sync-branch
+  PR_BASE_BRANCH: develop
 
 jobs:
   sync:
@@ -56,6 +61,7 @@ jobs:
             ${{ env.SOURCE_REPO }}
             ${{ github.repository }}
           permission-contents: write       # read the original, push to this repo
+          permission-pull-requests: write  # open the sync PR
 
       - name: Look up the App's bot user ID (for commit attribution)
         id: bot
@@ -112,3 +118,33 @@ jobs:
           git subtree merge --prefix="$TARGET_DIR" FETCH_HEAD \
             -m "Sync $TARGET_DIR from $SOURCE_REPO@$SOURCE_BRANCH"
           git push origin "HEAD:${TARGET_BRANCH}"
+
+      # Runs even when the previous step found nothing new, so a PR that failed
+      # to open on an earlier run still gets opened.
+      - name: Open a PR into the base branch if needed
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git fetch origin "$PR_BASE_BRANCH"
+
+          ahead=$(git rev-list --count "origin/${PR_BASE_BRANCH}..HEAD")
+          if [ "$ahead" -eq 0 ]; then
+            echo "$TARGET_BRANCH has nothing that $PR_BASE_BRANCH doesn't; no PR needed."
+            exit 0
+          fi
+
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$TARGET_BRANCH" --base "$PR_BASE_BRANCH" \
+            --state open --json number --jq 'length')
+          if [ "$open" -gt 0 ]; then
+            echo "A PR from $TARGET_BRANCH into $PR_BASE_BRANCH is already open; it now includes the new commits."
+            exit 0
+          fi
+
+          gh pr create --repo "$GITHUB_REPOSITORY" \
+            --head "$TARGET_BRANCH" --base "$PR_BASE_BRANCH" \
+            --title "Sync $TARGET_DIR from $SOURCE_REPO@$SOURCE_BRANCH" \
+            --body "Automated sync of \`$SOURCE_DIR\` from \`$SOURCE_REPO\` (\`$SOURCE_BRANCH\`) into \`$TARGET_DIR\`.
+
+          **Merge with a merge commit** (not squash or rebase), and keep \`$TARGET_BRANCH\` after merging, or later syncs will conflict."
