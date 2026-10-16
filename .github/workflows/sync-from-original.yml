@@ -2,12 +2,25 @@
 #
 # Runs when the original repo reports a change to the subdirectory. It clones
 # the original, re-splits the subdirectory history, and merges it into this
-# repo (a fast-forward when this repo has no commits of its own).
+# repo UNDER A FOLDER (TARGET_DIR) with `git subtree merge`, so the folder itself
+# is kept rather than its contents landing at the repo root.
 # Authenticates as a GitHub App for both the clone and the push.
 #
 # This file must be on the new repo's DEFAULT branch, or the
 # repository_dispatch event will not trigger it.
 #
+# Prerequisite (one time): TARGET_BRANCH must already contain the folder,
+# added with `git subtree add --prefix=<TARGET_DIR> ...`. Later syncs build on
+# that commit.
+#
+# Setup:
+#   1. Replace the values marked CHANGE ME below.
+#   2. Make these available to this repo (repo-level, or org-level limited
+#      to the two repos):
+#        variable  SUBDIR_SYNC_APP_CLIENT_ID    the App's Client ID
+#        secret    SUBDIR_SYNC_APP_PRIVATE_KEY  full contents of the App's .pem key
+#   3. The App needs "Contents: Read and write" and must be installed on
+#      both repos.
 
 name: Sync from original repo
 
@@ -25,9 +38,9 @@ concurrency:
 env:
   SOURCE_REPO: dustin-CGI-test-org/seagull
   SOURCE_BRANCH: develop
-  SUBDIR: subdir
+  SOURCE_DIR: subdir
+  TARGET_DIR: subdir
   TARGET_BRANCH: sync-branch
-  PR_BASE: develop
 
 jobs:
   sync:
@@ -43,7 +56,6 @@ jobs:
             ${{ env.SOURCE_REPO }}
             ${{ github.repository }}
           permission-contents: write       # read the original, push to this repo
-          permission-pull-requests: write  # open the PR into PR_BASE
 
       - name: Look up the App's bot user ID (for commit attribution)
         id: bot
@@ -64,19 +76,17 @@ jobs:
 
       - name: Split out the subdirectory history
         working-directory: source
-        run: git subtree split --prefix="$SUBDIR" -b subdir-split
+        run: git subtree split --prefix="$SOURCE_DIR" -b subdir-split
 
-      # Checks out the default branch, which always exists. fetch-depth: 0
-      # also fetches every other branch, so the next step can tell whether
-      # TARGET_BRANCH exists yet.
       - name: Check out this repo
         uses: actions/checkout@v6
         with:
+          ref: ${{ env.TARGET_BRANCH }}
           token: ${{ steps.app-token.outputs.token }}   # push as the App
-          fetch-depth: 0
+          fetch-depth: 0                   # subtree merge needs the full history
           path: target
 
-      - name: Merge the split history and push
+      - name: Merge the split history into the folder and push
         working-directory: target
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
@@ -85,52 +95,20 @@ jobs:
           git config user.name  "${APP_SLUG}[bot]"
           git config user.email "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
-          git fetch ../source subdir-split
-
-          # If the target branch doesn't exist, create it from the split
-          # and stop; there is nothing to merge into.
-          if ! git show-ref --verify --quiet "refs/remotes/origin/${TARGET_BRANCH}"; then
-            echo "Branch '${TARGET_BRANCH}' not found; creating it from the split."
-            git push origin "FETCH_HEAD:refs/heads/${TARGET_BRANCH}"
-            exit 0
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "::error::'$TARGET_DIR' does not exist on $TARGET_BRANCH. Seed it once with 'git subtree add --prefix=$TARGET_DIR ...' first."
+            exit 1
           fi
 
-          git checkout -B "$TARGET_BRANCH" "origin/${TARGET_BRANCH}"
+          git fetch ../source subdir-split
 
           if git merge-base --is-ancestor FETCH_HEAD HEAD; then
             echo "Already up to date; nothing to sync."
             exit 0
           fi
 
-          # Fast-forwards when possible; otherwise creates a merge commit.
+          # Merges the new commits into TARGET_DIR/ (always a merge commit).
           # A conflict fails the job so you can resolve it by hand.
-          git merge --no-edit FETCH_HEAD
+          git subtree merge --prefix="$TARGET_DIR" FETCH_HEAD \
+            -m "Sync $TARGET_DIR from $SOURCE_REPO@$SOURCE_BRANCH"
           git push origin "HEAD:${TARGET_BRANCH}"
-
-      # Runs even when the step above found nothing new, so a missing PR is
-      # always opened if TARGET_BRANCH has commits PR_BASE doesn't.
-      - name: Open a pull request into the base branch
-        working-directory: target
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          git fetch origin "$PR_BASE" "$TARGET_BRANCH"
-
-          ahead=$(git rev-list --count "origin/${PR_BASE}..origin/${TARGET_BRANCH}")
-          if [ "$ahead" -eq 0 ]; then
-            echo "'${PR_BASE}' already has everything in '${TARGET_BRANCH}'; no PR needed."
-            exit 0
-          fi
-
-          open=$(gh pr list --repo "$REPO" --head "$TARGET_BRANCH" --base "$PR_BASE" \
-                   --state open --json number --jq 'length')
-          if [ "$open" -gt 0 ]; then
-            echo "A pull request is already open; it now includes the new commits."
-            exit 0
-          fi
-
-          gh pr create --repo "$REPO" \
-            --head "$TARGET_BRANCH" --base "$PR_BASE" \
-            --title "Sync ${SUBDIR} from ${SOURCE_REPO}" \
-            --body "Automated sync of \`${SUBDIR}\` from ${SOURCE_REPO} (\`${SOURCE_BRANCH}\`)."
