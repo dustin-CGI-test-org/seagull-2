@@ -9,9 +9,10 @@
 # This file must be on the new repo's DEFAULT branch, or the
 # repository_dispatch event will not trigger it.
 #
-# Prerequisite (one time): TARGET_BRANCH must already contain the folder,
-# added with `git subtree add --prefix=<TARGET_DIR> ...`. Later syncs build on
-# that commit.
+# Seeding: the first run seeds itself. If TARGET_BRANCH doesn't exist yet it
+# is created from PR_BASE_BRANCH, and if TARGET_DIR doesn't exist on it the
+# folder is imported with full history via `git subtree add`. Every later run
+# does a `git subtree merge` on top of that import.
 #
 # Setup:
 #   1. Replace the values marked CHANGE ME below.
@@ -87,12 +88,21 @@ jobs:
       - name: Check out this repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ env.TARGET_BRANCH }}
           token: ${{ steps.app-token.outputs.token }}   # push as the App
-          fetch-depth: 0                   # subtree merge needs the full history
+          fetch-depth: 0                   # full history and all branches
           path: target
 
-      - name: Merge the split history into the folder and push
+      - name: Switch to the sync branch (creating it if needed)
+        working-directory: target
+        run: |
+          if git rev-parse --verify --quiet "refs/remotes/origin/${TARGET_BRANCH}" >/dev/null; then
+            git checkout -B "$TARGET_BRANCH" "origin/${TARGET_BRANCH}"
+          else
+            echo "$TARGET_BRANCH doesn't exist yet; creating it from $PR_BASE_BRANCH."
+            git checkout -B "$TARGET_BRANCH" "origin/${PR_BASE_BRANCH}"
+          fi
+
+      - name: Import or merge the split history into the folder and push
         working-directory: target
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
@@ -101,23 +111,24 @@ jobs:
           git config user.name  "${APP_SLUG}[bot]"
           git config user.email "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
-          if [ ! -d "$TARGET_DIR" ]; then
-            echo "::error::'$TARGET_DIR' does not exist on $TARGET_BRANCH. Seed it once with 'git subtree add --prefix=$TARGET_DIR ...' first."
-            exit 1
-          fi
-
           git fetch ../source subdir-split
 
-          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+          if [ ! -d "$TARGET_DIR" ]; then
+            # First run: import the folder with its full history.
+            echo "$TARGET_DIR doesn't exist yet; seeding it with git subtree add."
+            git subtree add --prefix="$TARGET_DIR" FETCH_HEAD \
+              -m "Add $TARGET_DIR from $SOURCE_REPO@$SOURCE_BRANCH"
+          elif git merge-base --is-ancestor FETCH_HEAD HEAD; then
             echo "Already up to date; nothing to sync."
-            exit 0
+          else
+            # Merges the new commits into TARGET_DIR/ (always a merge commit).
+            # A conflict fails the job so you can resolve it by hand.
+            git subtree merge --prefix="$TARGET_DIR" FETCH_HEAD \
+              -m "Sync $TARGET_DIR from $SOURCE_REPO@$SOURCE_BRANCH"
           fi
 
-          # Merges the new commits into TARGET_DIR/ (always a merge commit).
-          # A conflict fails the job so you can resolve it by hand.
-          git subtree merge --prefix="$TARGET_DIR" FETCH_HEAD \
-            -m "Sync $TARGET_DIR from $SOURCE_REPO@$SOURCE_BRANCH"
-          git push origin "HEAD:${TARGET_BRANCH}"
+          # Also creates the branch on the remote the first time.
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
 
       # Runs even when the previous step found nothing new, so a PR that failed
       # to open on an earlier run still gets opened.
